@@ -75,6 +75,18 @@ class OpenIdCredentialManager(CredentialManager):
 
     @rate_limit(6, 1800)
     def refresh_token_now(self):
+        return self._refresh_token_now()
+
+    # Separate quota from refresh_token_now: this one is only used as a prerequisite step
+    # inside the remote-services token refresh (RemoteClient._refresh_remote_token), which
+    # runs repeatedly while a vehicle is charging. Sharing one semaphore between that and the
+    # main login/reconnect flow let a broken remote token exhaust the quota needed to recover
+    # the main API token, turning a temporary remote-token hiccup into a multi-day lockout.
+    @rate_limit(6, 1800)
+    def refresh_token_for_remote(self):
+        return self._refresh_token_now()
+
+    def _refresh_token_now(self):
         try:
             self._refresh_token()
             for refresh_callback in self.refresh_callbacks:

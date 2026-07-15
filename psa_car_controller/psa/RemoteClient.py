@@ -168,7 +168,7 @@ class RemoteClient:
                 if (datetime.now() - last_update).total_seconds() < MQTT_TOKEN_TTL:
                     return True
             try:
-                self.manager.refresh_token_now()
+                self.manager.refresh_token_for_remote()
                 if bad_remote_token:
                     logger.warning("remote_refresh_token isn't defined")
                 else:
