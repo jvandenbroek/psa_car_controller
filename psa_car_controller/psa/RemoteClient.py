@@ -61,7 +61,11 @@ class RemoteClient:
 
     def _on_mqtt_disconnect(self, client, userdata, result_code):  # pylint: disable=unused-argument
         logger.warning("Disconnected with result code %d", result_code)
-        if result_code == 1:
+        # 1 = incorrect protocol version, 5 = not authorised (stale/expired remote access token).
+        # paho-mqtt reconnects automatically after either, but without forcing a fresh token here
+        # it keeps retrying with the same rejected credentials until the next unrelated publish()
+        # call happens to refresh them, producing a repeating connect/reject loop in the meantime.
+        if result_code in (1, 5):
             self._refresh_remote_token(force=True)
         else:
             logger.warning(mqtt.error_string(result_code))
