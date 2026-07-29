@@ -24,6 +24,8 @@ MQTT_SERVER = "mwa.mpsa.com"
 MQTT_RESP_TOPIC = "psa/RemoteServices/to/cid/"
 MQTT_EVENT_TOPIC = "psa/RemoteServices/events/MPHRTServices/"
 MQTT_TOKEN_TTL = 890
+MQTT_WATCHDOG_INTERVAL = 120
+MQTT_STUCK_RECONNECT_THRESHOLD = 300
 
 
 class RemoteException(Exception):
@@ -49,9 +51,12 @@ class RemoteClient:
         self.otp = None
         self._lock = threading.Lock()
         self.update_thread: threading.Timer = None
+        self.watchdog_thread: threading.Timer = None
+        self._disconnected_since: datetime = None
 
     def __on_mqtt_connect(self, client, userdata, result_code, _):  # pylint: disable=unused-argument
         logger.info("Connected with result code %s", result_code)
+        self._disconnected_since = None
         topics = [MQTT_RESP_TOPIC + self.account_info.get_mqtt_customer_id() + "/#"]
         for car in self.vehicles_list:
             topics.append(MQTT_EVENT_TOPIC + car.vin)
@@ -61,6 +66,8 @@ class RemoteClient:
 
     def _on_mqtt_disconnect(self, client, userdata, result_code):  # pylint: disable=unused-argument
         logger.warning("Disconnected with result code %d", result_code)
+        if self._disconnected_since is None:
+            self._disconnected_since = datetime.now()
         # 1 = incorrect protocol version, 5 = not authorised (stale/expired remote access token).
         # paho-mqtt reconnects automatically after either, but without forcing a fresh token here
         # it keeps retrying with the same rejected credentials until the next unrelated publish()
@@ -123,6 +130,7 @@ class RemoteClient:
                 self.mqtt_client.connect(MQTT_SERVER, 8885, 60)
                 self.mqtt_client.loop_start()
                 self.__keep_mqtt()
+                self.__mqtt_watchdog()
                 return self.mqtt_client.is_connected()
         logger.error("Can't configure MQTT Client")
         return False
@@ -135,6 +143,9 @@ class RemoteClient:
         if self.update_thread:
             self.update_thread.cancel()
             self.update_thread.join(timeout=TIMEOUT_IN_S)
+        if self.watchdog_thread:
+            self.watchdog_thread.cancel()
+            self.watchdog_thread.join(timeout=TIMEOUT_IN_S)
 
     def __keep_mqtt(self):  # avoid token expiration
         timeout = 3600 * 24  # 1 day
@@ -146,6 +157,33 @@ class RemoteClient:
         self.update_thread = threading.Timer(timeout, self.__keep_mqtt)
         self.update_thread.daemon = True
         self.update_thread.start()
+
+    def __mqtt_watchdog(self):
+        # Safety net: paho's own reconnect logic (loop_start's built-in exponential backoff)
+        # can end up permanently failing after a disconnect for reasons unrelated to the token
+        # (e.g. a rate-limited refresh in _on_mqtt_disconnect/_refresh_remote_token, or a stale
+        # NAT/conntrack mapping on the network path). Observed: 3+ hours stuck disconnected,
+        # only recovered by a full container restart. Force a clean reconnect if disconnected
+        # for too long, regardless of the underlying cause.
+        try:
+            if (self._disconnected_since is not None and
+                    (datetime.now() - self._disconnected_since).total_seconds() > MQTT_STUCK_RECONNECT_THRESHOLD):
+                logger.error("mqtt stuck disconnected for over %ds, forcing reconnect",
+                             MQTT_STUCK_RECONNECT_THRESHOLD)
+                self._disconnected_since = None
+                try:
+                    self.mqtt_client.loop_stop()
+                    self._refresh_remote_token(force=True)
+                    self.mqtt_client.reconnect()
+                    self.mqtt_client.loop_start()
+                except Exception:
+                    logger.exception("__mqtt_watchdog: forced reconnect failed")
+                    self._disconnected_since = datetime.now()
+        except Exception:
+            logger.exception("__mqtt_watchdog")
+        self.watchdog_thread = threading.Timer(MQTT_WATCHDOG_INTERVAL, self.__mqtt_watchdog)
+        self.watchdog_thread.daemon = True
+        self.watchdog_thread.start()
 
     def veh_charge_request(self, vin, hour, minute, charge_type):
         msg = self.mqtt_request(vin, {"program": {"hour": hour, "minute": minute}, "type": charge_type}, "/VehCharge")
@@ -193,7 +231,12 @@ class RemoteClient:
                 if bad_remote_token:
                     otp_code = self.get_otp_code()
                     self._get_remote_access_token(otp_code)
-                self.remote_token_last_update = datetime.now()
+                # Bumps the TTL cache checked at the top of this method (self.remoteCredentials.last_update).
+                # Previously wrote to self.remote_token_last_update, a different, unread attribute, so the
+                # cache never actually took effect: every publish()/wakeup() call re-hit the network and
+                # consumed a refresh_token_for_remote() rate-limit slot, even seconds apart. During a burst
+                # of wakeups (e.g. car becoming active) this exhausted the quota in under two minutes.
+                self.remoteCredentials.last_update = datetime.now()
                 self.mqtt_client.username_pw_set("IMA_OAUTH_ACCESS_TOKEN", self.remoteCredentials.access_token)
                 return True
             except RateLimitException as e:
