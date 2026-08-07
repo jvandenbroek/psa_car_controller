@@ -3,7 +3,6 @@ import logging
 import threading
 from datetime import datetime
 from os import environ
-import time
 
 import paho.mqtt.client as mqtt
 from requests import RequestException
@@ -110,12 +109,24 @@ class RemoteClient:
             try:
                 car = self.vehicles_list.get_car_by_vin(vin=vin)
                 if car and car.status.get_energy('Electric').charging.status != INPROGRESS:
-                    # fix a psa server bug where charge beginning without status api being properly updated
+                    # fix a psa server bug where charge beginning without status api being properly updated.
+                    # Run the wakeup after a delay on a background timer instead of blocking here:
+                    # this method runs inside paho's on_message callback, and a 60s time.sleep()
+                    # here stalls the mqtt network loop long enough to miss the keepalive PINGREQ,
+                    # causing the broker to drop the connection (observed as repeated
+                    # "Client or broker did not communicate in the keepalive interval" disconnects).
                     logger.warning("charge begin but API isn't updated")
-                    time.sleep(60)
-                    self.wakeup(vin)
+                    timer = threading.Timer(60, self._delayed_wakeup, args=(vin,))
+                    timer.daemon = True
+                    timer.start()
             except (IndexError, AttributeError, RateLimitException):
                 logger.exception("on_mqtt_message:")
+
+    def _delayed_wakeup(self, vin):
+        try:
+            self.wakeup(vin)
+        except RateLimitException:
+            logger.exception("_delayed_wakeup:")
 
     def start(self):
         if self.load_otp():
