@@ -105,7 +105,11 @@ class RemoteClient:
             logger.exception("on_mqtt_message:")
 
     def _fix_not_updated_api(self, charge_info, vin):
-        if charge_info is not None and (charge_info.get('remaining_time', 0) != 0 or charge_info.get('rate', 0) != 0):
+        # Only trust 'rate' != 0 as the "actually charging" signal. PSA's 'remaining_time'
+        # has been observed stuck at a stale nonzero value for days after the car was
+        # unplugged (rate=0, cable_detected stale too), which used to false-trigger this
+        # workaround on every duplicate/retried event PSA resent for that stale payload.
+        if charge_info is not None and charge_info.get('rate', 0) != 0:
             try:
                 car = self.vehicles_list.get_car_by_vin(vin=vin)
                 if car and car.status.get_energy('Electric').charging.status != INPROGRESS:
