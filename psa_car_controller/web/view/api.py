@@ -202,6 +202,93 @@ def get_trips():
         return jsonify([])
 
 
+def _bin_avg(rows, key, width):
+    """Average `key` per bin of `width`, bin label = lower edge. Skips rows without value."""
+    bins = {}
+    for r in rows:
+        v, x = r.get(key), r.get("_x")
+        if v is None or x is None:
+            continue
+        b = int(x // width) * width
+        acc = bins.setdefault(b, [0.0, 0])
+        acc[0] += v
+        acc[1] += 1
+    return [{"from": b, "to": b + width, "avg": round(acc[0] / acc[1], 2), "n": acc[1]}
+            for b, acc in sorted(bins.items())]
+
+
+def _charging_summary():
+    """Totals + per-month kWh/price/sessions from Charging.get_chargings()."""
+    months = {}
+    total_kwh = total_price = 0.0
+    sessions = 0
+    for c in Charging.get_chargings():
+        sessions += 1
+        start = c.get("start_at")
+        if hasattr(start, "strftime"):
+            ym = start.strftime("%Y-%m")
+        else:
+            ym = str(start)[:7]
+        m = months.setdefault(ym, {"month": ym, "kwh": 0.0, "price": 0.0, "sessions": 0})
+        m["sessions"] += 1
+        if c.get("kw") is not None:
+            m["kwh"] += c["kw"]
+            total_kwh += c["kw"]
+        if c.get("price") is not None:
+            m["price"] += c["price"]
+            total_price += c["price"]
+    by_month = [dict(m, kwh=round(m["kwh"], 2), price=round(m["price"], 2)) for _, m in sorted(months.items())]
+    return {"sessions": sessions, "kwh_total": round(total_kwh, 2), "price_total": round(total_price, 2),
+            "by_month": by_month}
+
+
+@app.route('/vehicles/trips_summary')
+def get_trips_summary():
+    """Compact summary for HA (stays well under the 16 KB HA attribute limit)."""
+    empty = {"count": 0, "trips": [], "by_temp": [], "by_speed": []}
+    try:
+        if not APP.myp.vehicles_list:
+            return jsonify(empty)
+        car = APP.myp.vehicles_list[0]
+        trips = Trips.get_trips(Cars([car]))[car.vin]
+        rows = []
+        for t in trips.get_trips_as_dict():
+            start = t.get("start_at")
+            rows.append({
+                "start_at": start.isoformat() if hasattr(start, "isoformat") else start,
+                "temp": t.get("consumption_by_temp"),
+                "speed": t.get("speed_average"),
+                "consumption_km": t.get("consumption_km"),
+                "distance": t.get("distance"),
+                # ruwe duur uit get_info staat al in minuten
+                "duration_min": round(t["duration"], 1) if t.get("duration") is not None else None,
+            })
+        # drop trips without a measured consumption (0/None)
+        # ritten < 5 km: accu meet in stappen van 1% (~0,5 kWh), dat geeft bij korte ritten absurde kWh/100km
+        # bovengrens 40 kWh/100 km: meetfout-uitschieters, ook bij ritten >= 5 km
+        rows = [r for r in rows if r["consumption_km"] and (r["distance"] or 0) >= 5
+                and r["consumption_km"] <= 40]
+        # _x: axis value per row for binning (temp in °C, speed in km/h)
+        by_temp_rows = [dict(r, _x=r["temp"]) for r in rows]
+        by_speed_rows = [dict(r, _x=r["speed"]) for r in rows]
+        # ?trips=0 leaves out the per-trip list: HA attributes are capped at 16 KB
+        include_trips = request.args.get("trips", "1") != "0"
+        return jsonify({
+            "count": len(rows),
+            "trips": rows if include_trips else [],
+            "by_temp": _bin_avg(by_temp_rows, "consumption_km", 5),
+            "by_speed": _bin_avg(by_speed_rows, "consumption_km", 5),
+            "charging": _charging_summary(),
+            # compact per-trip series for time charts, fits HA attribute cap even with trips=0
+            # [start_at, distance_km, duration_min, speed_avg, temp_c, consumption_km]
+            "series": [[r["start_at"], r["distance"], r["duration_min"], r["speed"], r["temp"],
+                        r["consumption_km"]] for r in rows],
+        })
+    except (IndexError, TypeError, KeyError):
+        logger.debug("Failed to build trips summary, probably not enough data yet:", exc_info=True)
+        return jsonify(empty)
+
+
 @app.route('/vehicles/chargings')
 def get_chargings():
     try:
